@@ -50,6 +50,15 @@ class TextTsqlVisitor extends withExtractor(TSqlParserVisitor) {
             const colName = sqlNameText(idArr[0]);
             if (colName) this.addSymbol("field", colName, ctx);
         }
+        // Foreign keys are cross-table dependencies: this table USES the
+        // referenced table. Both the inline column FK and the named table
+        // CONSTRAINT wrap the referenced table_name in foreign_key_options,
+        // which never contains this table's own name — so no self-reference.
+        for (const fko of findDescendants(ctx, "Foreign_key_optionsContext")) {
+            const refTable = (fko as { table_name?: () => unknown }).table_name?.();
+            const fkName = sqlNameText(refTable);
+            if (fkName) this.addRef("use", fkName, refTable as never, { container: name });
+        }
         return null;
     };
 
@@ -58,15 +67,22 @@ class TextTsqlVisitor extends withExtractor(TSqlParserVisitor) {
         const sn = ctx.simple_name?.();
         const name = sqlNameText(sn);
         if (name) this.addSymbol("class", name, ctx);
+        // A view USES every table its SELECT reads — the core SQL graph edge
+        // (view → use → source tables). container = the view being created.
+        if (name) this.refSourceTables(ctx, name);
         return null;
     };
 
     visitCreate_index = (ctx: any): null => {
         if (this.inBody) return null;
-        // create_index: CREATE UNIQUE? clustered? INDEX id_ ON ...
+        // create_index: CREATE UNIQUE? clustered? INDEX id_ ON table_name ...
         const ids = collectChildren(ctx, "id_");
         const name = sqlNameText(ids[0]);
         if (name) this.addSymbol("field", name, ctx);
+        // An index attaches to its ON table.
+        const onTable = ctx.table_name?.();
+        const onName = sqlNameText(onTable);
+        if (name && onName) this.addRef("use", onName, onTable, { container: name });
         return null;
     };
 
@@ -75,6 +91,13 @@ class TextTsqlVisitor extends withExtractor(TSqlParserVisitor) {
         const sn = ctx.simple_name?.();
         const name = sqlNameText(sn);
         if (name) this.addSymbol("method", name, ctx);
+        // A trigger references its ON table and every table its body touches.
+        if (name) {
+            const onTable = ctx.table_name?.();
+            const onName = sqlNameText(onTable);
+            if (onName) this.addRef("use", onName, onTable, { container: name });
+            this.refSourceTables(ctx, name);
+        }
         return null;
     };
 
@@ -92,6 +115,9 @@ class TextTsqlVisitor extends withExtractor(TSqlParserVisitor) {
         const fps = ctx.func_proc_name_schema?.();
         const name = sqlNameText(fps);
         if (name) this.addSymbol("function", name, ctx);
+        // A stored procedure USES every table its body reads/writes — a rich
+        // T-SQL graph edge (proc → use → tables). container = the procedure.
+        if (name) this.refSourceTables(ctx, name);
         return null;
     };
 
@@ -130,6 +156,18 @@ class TextTsqlVisitor extends withExtractor(TSqlParserVisitor) {
         if (name) this.addSymbol("field", name, ctx);
         return null;
     };
+
+    // Emit a `use` ref for every real source table under `ctx`, owned by the
+    // created object `container`. table_source_item.full_table_name() is the
+    // clean path: it yields only FROM/JOIN/subquery tables, excluding the bare
+    // alias references (o.Id, u.Name) that also surface as full_table_name.
+    private refSourceTables(ctx: unknown, container: string): void {
+        for (const item of findDescendants(ctx, "Table_source_itemContext")) {
+            const ftn = (item as { full_table_name?: () => unknown }).full_table_name?.();
+            const tableName = sqlNameText(ftn);
+            if (tableName) this.addRef("use", tableName, ftn as never, { container });
+        }
+    }
 }
 
 function sqlNameText(ctx: unknown): string | null {
@@ -139,12 +177,31 @@ function sqlNameText(ctx: unknown): string | null {
     return unquoteSqlIdentifier(raw);
 }
 
+// Normalize a (possibly schema-qualified, possibly bracket-quoted) T-SQL
+// identifier to its bare object name. [dbo].[Users] → Users; dbo.Orders →
+// Orders; [Users-2024] → Users-2024. Splitting on dots OUTSIDE brackets keeps
+// refs and defs in agreement regardless of how a name was written.
 function unquoteSqlIdentifier(s: string): string {
+    return unquotePart(lastDottedComponent(s));
+}
+
+function lastDottedComponent(s: string): string {
+    let inBracket = false;
+    for (let i = s.length - 1; i >= 0; i -= 1) {
+        const ch = s[i];
+        if (ch === "]") inBracket = true;
+        else if (ch === "[") inBracket = false;
+        else if (ch === "." && !inBracket) return s.slice(i + 1);
+    }
+    return s;
+}
+
+function unquotePart(s: string): string {
     if (s.length >= 2) {
         const first = s[0];
         const last = s[s.length - 1];
         if (first === '"' && last === '"') return s.slice(1, -1).replace(/""/g, '"');
-        if (first === "[" && last === "]") return s.slice(1, -1);
+        if (first === "[" && last === "]") return s.slice(1, -1).replace(/]]/g, "]");
     }
     return s;
 }
