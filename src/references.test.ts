@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { assertHandlerConformance } from "@plurnk/plurnk-mimetypes/conformance";
 import TextTsql from "./TextTsql.ts";
 
 const h = () => new TextTsql({ mimetype: "text/x-tsql", glyph: "🗄", extensions: [".sql"] as const });
@@ -65,5 +66,22 @@ describe("text/x-tsql references (ANTLR refs grind)", () => {
         assert.ok(defNames.has("Users") && defNames.has("Orders"));
         // A def's own name never appears as a ref (no self-reference).
         assert.ok(!refs.some((r) => r.name === r.container));
+    });
+
+    it("passes the SPEC §16 conformance harness", async () => {
+        await assertHandlerConformance(h(), {
+            source: SQL,
+            decoyNames: ["StringDecoy", "CommentDecoy"],
+            expectJoins: [
+                { refName: "Orders", container: "ActiveOrders" },
+                { refName: "Users", container: "ActiveOrders" },
+                { refName: "Users", container: "Orders" },
+            ],
+            expectRefs: [
+                { name: "Users", kind: "use" },
+                { name: "Orders", kind: "use" },
+                { name: "AuditLog", kind: "use" },
+            ],
+        });
     });
 });
